@@ -19,6 +19,7 @@ import (
 	"github.com/DataDog/dd-trace-go/v2/internal/remoteconfig"
 	"github.com/DataDog/dd-trace-go/v2/internal/samplingrules"
 	"github.com/DataDog/dd-trace-go/v2/internal/telemetry"
+	"github.com/DataDog/dd-trace-go/v2/internal/tracerflare"
 
 	"github.com/DataDog/datadog-agent/pkg/remoteconfig/state"
 )
@@ -322,7 +323,7 @@ func (t *tracer) startRemoteConfig(rcConfig remoteconfig.ClientConfig) error {
 		return err
 	}
 
-	var dynamicInstrumentationError, apmTracingError error
+	var dynamicInstrumentationError, apmTracingError, tracerFlareError error
 
 	if t.config.internalConfig.DynamicInstrumentationEnabled() {
 		dynamicInstrumentationError = t.startDynamicInstrumentationRCSubscriptions()
@@ -339,6 +340,11 @@ func (t *tracer) startRemoteConfig(rcConfig remoteconfig.ClientConfig) error {
 		remoteconfig.APMTracingMulticonfig,
 		remoteconfig.APMTracingEnableLiveDebugging,
 	)
+	tracerFlareError = tracerflare.Subscribe(tracerflare.Config{
+		AgentURL:   rcConfig.AgentURL,
+		HTTPClient: t.config.httpClient,
+		ConfigDump: func() ([]byte, error) { return json.Marshal(t.newStartupInfo()) },
+	})
 
 	if internalffe.RemoteConfigSourceSelected(t.config.internalConfig) {
 		if err := internalffe.SubscribeRC(); err != nil {
@@ -346,12 +352,8 @@ func (t *tracer) startRemoteConfig(rcConfig remoteconfig.ClientConfig) error {
 		}
 	}
 
-	if apmTracingError != nil || dynamicInstrumentationError != nil {
-		return fmt.Errorf(
-			"could not subscribe to at least one remote config product: %w; %w",
-			apmTracingError,
-			dynamicInstrumentationError,
-		)
+	if err := errors.Join(apmTracingError, dynamicInstrumentationError, tracerFlareError); err != nil {
+		return fmt.Errorf("could not subscribe to at least one remote config product: %w", err)
 	}
 
 	return nil

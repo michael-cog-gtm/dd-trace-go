@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/DataDog/dd-trace-go/v2/instrumentation/appsec/dyngo"
+	"github.com/DataDog/dd-trace-go/v2/internal/locking"
 	"github.com/DataDog/dd-trace-go/v2/internal/version"
 )
 
@@ -116,6 +117,7 @@ var (
 	levelThreshold atomic.Int32 // stores Level as int32; accessed atomically to avoid lock contention in hot paths
 	mu             sync.RWMutex // guards logger instance
 	logger         Logger       = &defaultLogger{l: log.New(os.Stderr, "", log.LstdFlags)}
+	captureSink    atomic.Pointer[Capture]
 )
 
 func init() {
@@ -168,6 +170,97 @@ func DefaultLevel() Level {
 // GetLevel returns the currrent log level.
 func GetLevel() Level {
 	return Level(levelThreshold.Load())
+}
+
+const captureTruncationMarker = "[tracer flare log truncated]\n"
+
+// Capture stores a bounded snapshot of tracer log output.
+type Capture struct {
+	mu            locking.Mutex
+	previousLevel Level
+	level         Level
+	threshold     Level
+	maxBytes      int
+	data          []byte
+	truncated     bool
+	stopped       bool
+}
+
+// StartCapture lowers the log threshold when needed and captures messages at or
+// above lvl. Only one capture may be active at a time.
+func StartCapture(lvl Level, maxBytes int) *Capture {
+	c := &Capture{
+		previousLevel: GetLevel(),
+		level:         lvl,
+		maxBytes:      maxBytes,
+	}
+	if !captureSink.CompareAndSwap(nil, c) {
+		return nil
+	}
+	c.SetLevel(lvl)
+	return c
+}
+
+// SetLevel changes the minimum level recorded by an active capture.
+func (c *Capture) SetLevel(lvl Level) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopped || captureSink.Load() != c {
+		return
+	}
+	c.level = lvl
+	c.threshold = min(c.previousLevel, lvl)
+	levelThreshold.Store(int32(c.threshold))
+}
+
+// Stop ends the capture, conditionally restores the previous log threshold, and
+// returns a copy of the captured bytes. It is safe to call multiple times.
+func (c *Capture) Stop() []byte {
+	if c == nil {
+		return nil
+	}
+	captureSink.CompareAndSwap(c, nil)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.stopped {
+		c.stopped = true
+		levelThreshold.CompareAndSwap(int32(c.threshold), int32(c.previousLevel))
+	}
+	return append([]byte(nil), c.data...)
+}
+
+func (c *Capture) record(lvl Level, msg string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopped || c.truncated || lvl < c.level {
+		return
+	}
+	line := time.Now().UTC().Format(time.RFC3339Nano) + " " + msg + "\n"
+	if len(c.data)+len(line) <= c.maxBytes {
+		c.data = append(c.data, line...)
+		return
+	}
+
+	c.truncated = true
+	if c.maxBytes <= 0 {
+		return
+	}
+	if len(captureTruncationMarker) >= c.maxBytes {
+		c.data = append(c.data[:0], captureTruncationMarker[:c.maxBytes]...)
+		return
+	}
+	keep := c.maxBytes - len(captureTruncationMarker)
+	if len(c.data) > keep {
+		c.data = c.data[:keep]
+	}
+	if remaining := keep - len(c.data); remaining > 0 {
+		c.data = append(c.data, line[:min(remaining, len(line))]...)
+	}
+	c.data = append(c.data, captureTruncationMarker...)
+}
+
+func (c *Capture) suppressDebugForwarding() bool {
+	return c.previousLevel != LevelDebug
 }
 
 // DebugEnabled returns true if debug log messages are enabled. This can be used in extremely
@@ -307,13 +400,20 @@ func printMsg(lvl Level, format string, a ...any) {
 	b.WriteString(lvl.String())
 	b.WriteString(": ")
 	b.WriteString(fmt.Sprintf(format, a...))
+	msg := b.String()
+	if capture := captureSink.Load(); capture != nil {
+		capture.record(lvl, msg)
+		if lvl == LevelDebug && capture.suppressDebugForwarding() {
+			return
+		}
+	}
 	mu.RLock()
 	if ll, ok := logger.(interface {
 		LogL(lvl Level, msg string)
 	}); !ok {
-		logger.Log(b.String())
+		logger.Log(msg)
 	} else {
-		ll.LogL(lvl, b.String())
+		ll.LogL(lvl, msg)
 	}
 	mu.RUnlock()
 }

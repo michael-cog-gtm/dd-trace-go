@@ -624,6 +624,9 @@ func recordingClientConfig(t *testing.T, requests chan<- struct{}) ClientConfig 
 			if !r.URL.IsAbs() {
 				t.Errorf("RC request URL is not absolute: %q", r.URL)
 			}
+			if r.Method != http.MethodPost {
+				t.Errorf("RC request method is %q, want %q", r.Method, http.MethodPost)
+			}
 			// http.RoundTripper is responsible for closing the request body.
 			if r.Body != nil {
 				r.Body.Close()
