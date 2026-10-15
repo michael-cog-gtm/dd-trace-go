@@ -346,7 +346,7 @@ func (c *Client) updateState() {
 		return
 	}
 
-	req, err := http.NewRequest(http.MethodGet, c.endpoint, &data)
+	req, err := http.NewRequest(http.MethodPost, c.endpoint, &data)
 	if err != nil {
 		telemetrylog.LogAndReportError("remoteconfig: unexpected error while creating a new http request", err)
 		return

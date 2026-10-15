@@ -50,6 +50,10 @@ Contains internal Orchestrion implementations for all supported contribs in [./o
 
 Defines the types and parsing logic for trace and span sampling rules (`DD_TRACE_SAMPLING_RULES`, `DD_SPAN_SAMPLING_RULES`, and their `WithSamplingRules` code equivalents), including glob/regex matching, rate limiting, and Remote Config provenance. It is shared between `internal/config` (configuration ownership) and `ddtrace/tracer` (runtime sampling decisions).
 
+### Tracer Flare
+
+Handles agent-triggered tracer flare tasks, including bounded process-wide log capture, tracer configuration snapshots, and multipart uploads to the trace agent.
+
 ### Telemetry
 
 The API, struct types, and other values necessary for:

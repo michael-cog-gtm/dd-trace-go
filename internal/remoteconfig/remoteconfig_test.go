@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strconv"
 	"strings"
@@ -609,6 +610,34 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+func TestUpdateStateUsesPOST(t *testing.T) {
+	type requestInfo struct {
+		method string
+		path   string
+	}
+	requests := make(chan requestInfo, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- requestInfo{method: r.Method, path: r.URL.Path}
+		_, _ = w.Write([]byte("{}"))
+	}))
+	defer server.Close()
+
+	cfg := DefaultClientConfig()
+	cfg.AgentURL = server.URL
+	cfg.HTTP = server.Client()
+	c, err := newClient(cfg)
+	require.NoError(t, err)
+	c.updateState()
+
+	select {
+	case req := <-requests:
+		require.Equal(t, http.MethodPost, req.method)
+		require.Equal(t, "/v0.7/config", req.path)
+	case <-time.After(time.Second):
+		t.Fatal("updateState did not send a request")
+	}
+}
+
 // recordingClientConfig returns an RC client config whose HTTP client records
 // each request (non-blocking) and returns an empty body. PollInterval is 1h, so
 // a request seen within the test window can only be a Subscribe-driven poll.
@@ -623,6 +652,9 @@ func recordingClientConfig(t *testing.T, requests chan<- struct{}) ClientConfig 
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			if !r.URL.IsAbs() {
 				t.Errorf("RC request URL is not absolute: %q", r.URL)
+			}
+			if r.Method != http.MethodPost {
+				t.Errorf("RC request method is %q, want %q", r.Method, http.MethodPost)
 			}
 			// http.RoundTripper is responsible for closing the request body.
 			if r.Body != nil {

@@ -137,9 +137,9 @@ func checkEndpoint(c *http.Client, endpoint string, protocol float64, extraHeade
 	return nil
 }
 
-// logStartup generates a startupInfo for a tracer and writes it to the log in
-// JSON format.
-func logStartup(t *tracer) {
+// newStartupInfo returns the current tracer startup configuration without
+// contacting the agent.
+func (t *tracer) newStartupInfo() startupInfo {
 	tags := make(map[string]string)
 	globalTags := t.config.internalConfig.GlobalTags()
 	for k, v := range globalTags {
@@ -229,6 +229,14 @@ func logStartup(t *tracer) {
 		info.SampleRateLimit = fmt.Sprintf("%v", limit)
 	}
 	t.addOTelStartupInfo(&info)
+	return info
+}
+
+// logStartup generates a startupInfo for a tracer and writes it to the log in
+// JSON format.
+func logStartup(t *tracer) {
+	info := t.newStartupInfo()
+	proto := t.config.effectiveTraceProtocol()
 	if !t.config.internalConfig.LogToStdout() {
 		startupHeaders := traceTransportHeaders(t.config.internalConfig)
 		if err := checkEndpoint(t.config.httpClient, t.config.ddTransport.endpoint(proto), proto, startupHeaders); err != nil {

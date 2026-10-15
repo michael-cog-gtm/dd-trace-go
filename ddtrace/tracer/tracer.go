@@ -8,6 +8,7 @@ package tracer
 import (
 	gocontext "context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -45,6 +46,7 @@ import (
 	"github.com/DataDog/dd-trace-go/v2/internal/telemetry"
 	telemetrylog "github.com/DataDog/dd-trace-go/v2/internal/telemetry/log"
 	"github.com/DataDog/dd-trace-go/v2/internal/traceprof"
+	"github.com/DataDog/dd-trace-go/v2/internal/tracerflare"
 	"github.com/DataDog/dd-trace-go/v2/internal/version"
 
 	"github.com/DataDog/datadog-agent/pkg/obfuscate"
@@ -240,6 +242,15 @@ var statsInterval = 10 * time.Second
 // TODO: The entire Start/Stop code should be refactored, it's pretty gnarly.
 var startStopMu locking.Mutex
 
+type flareRemoteConfigState struct {
+	mu      locking.Mutex
+	cancel  gocontext.CancelFunc // +checklocks:mu
+	done    chan struct{}        // +checklocks:mu
+	started bool                 // +checklocks:mu
+}
+
+var flareRC flareRemoteConfigState
+
 // reportInitTime reports the tracer initialization duration as a telemetry metric.
 func reportInitTime(start time.Time) {
 	telemetry.Distribution(telemetry.NamespaceGeneral, "init_time", nil).Submit(float64(time.Since(start).Milliseconds()))
@@ -255,6 +266,7 @@ func Start(opts ...StartOption) error {
 func start(ciVisibilityBootstrap bool, opts ...StartOption) error {
 	startStopMu.Lock()
 	defer startStopMu.Unlock()
+	stopFlareOnlyRemoteConfig()
 
 	defer reportInitTime(time.Now())
 
@@ -270,6 +282,7 @@ func start(ciVisibilityBootstrap bool, opts ...StartOption) error {
 		// telemetry information. Will be fixed when the tracer and profiler
 		// share control of the global telemetry client.
 		t.Stop()
+		t.startFlareRemoteConfig()
 		return nil
 	}
 	ciVisibilityEnabled := t.config.internalConfig.CIVisibilityEnabled()
@@ -401,12 +414,7 @@ func buildLLMObsConfig(c *config) (llmobsconfig.Config, error) {
 // production Start path and the inspectable-tracer bootstrap call this method so
 // that WithAppSecEnabled and friends activate identically in both environments.
 func (t *tracer) startAppSec() {
-	cfg := remoteconfig.DefaultClientConfig()
-	cfg.AgentURL = t.config.internalConfig.AgentURL().String()
-	cfg.AppVersion = t.config.internalConfig.Version()
-	cfg.Env = t.config.internalConfig.Env()
-	cfg.HTTP = t.config.httpClient
-	cfg.ServiceName = t.config.internalConfig.ServiceName()
+	cfg := t.remoteConfigClientConfig()
 	if t.config.agent.load().hasRemoteConfig {
 		if err := t.startRemoteConfig(cfg); err != nil {
 			if errors.Is(err, remoteconfig.ErrClientNotStarted) {
@@ -420,6 +428,90 @@ func (t *tracer) startAppSec() {
 	appsecopts = append(appsecopts, t.config.appsecStartOptions...)
 	appsecopts = append(appsecopts, appsecConfig.WithRCConfig(cfg), appsecConfig.WithMetaStructAvailable(t.config.agent.load().metaStructAvailable))
 	appsec.Start(appsecopts...)
+}
+
+func (t *tracer) remoteConfigClientConfig() remoteconfig.ClientConfig {
+	cfg := remoteconfig.DefaultClientConfig()
+	cfg.AgentURL = t.config.internalConfig.AgentURL().String()
+	cfg.AppVersion = t.config.internalConfig.Version()
+	cfg.Env = t.config.internalConfig.Env()
+	cfg.HTTP = t.config.httpClient
+	cfg.ServiceName = t.config.internalConfig.ServiceName()
+	return cfg
+}
+
+func (t *tracer) startFlareRemoteConfig() {
+	if t.config.internalConfig.LogToStdout() || t.config.internalConfig.CIVisibilityAgentlessActive() {
+		return
+	}
+
+	ctx, cancel := gocontext.WithCancel(gocontext.Background())
+	done := make(chan struct{})
+	flareRC.mu.Lock()
+	flareRC.cancel = cancel
+	flareRC.done = done
+	flareRC.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		fetchCtx, fetchCancel := gocontext.WithTimeout(ctx, 2*time.Second)
+		defer fetchCancel()
+
+		features, err := fetchAgentFeatures(fetchCtx, t.config.internalConfig.AgentURL(), t.config.httpClient)
+		if err != nil {
+			log.Debug("tracer flare: unable to fetch agent features: %s", err.Error())
+			return
+		}
+		if !features.hasRemoteConfig {
+			log.Debug("tracer flare: agent does not support remote config")
+			return
+		}
+
+		flareRC.mu.Lock()
+		defer flareRC.mu.Unlock()
+		if ctx.Err() != nil {
+			return
+		}
+		if err := remoteconfig.Start(t.remoteConfigClientConfig()); err != nil {
+			log.Warn("Remote config startup error: %s", err.Error())
+			return
+		}
+		if err := tracerflare.Subscribe(tracerflare.Config{
+			AgentURL:   t.config.internalConfig.AgentURL().String(),
+			HTTPClient: t.config.httpClient,
+			ConfigDump: func() ([]byte, error) { return json.Marshal(t.newStartupInfo()) },
+		}); err != nil {
+			if errors.Is(err, remoteconfig.ErrClientNotStarted) {
+				log.Debug("remoteconfig: client not started, remote configuration is disabled")
+			} else {
+				log.Warn("Remote config startup error: %s", err.Error())
+			}
+			remoteconfig.Stop()
+			return
+		}
+		flareRC.started = true
+	}()
+}
+
+func stopFlareOnlyRemoteConfig() {
+	flareRC.mu.Lock()
+	cancel, done := flareRC.cancel, flareRC.done
+	flareRC.cancel = nil
+	flareRC.done = nil
+	flareRC.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+		<-done
+	}
+
+	flareRC.mu.Lock()
+	if flareRC.started {
+		remoteconfig.Stop()
+		tracerflare.Reset()
+		flareRC.started = false
+	}
+	flareRC.mu.Unlock()
 }
 
 // storeConfig stores the process level tracing context both in an in-memory file and
@@ -477,6 +569,7 @@ func Stop() {
 	startStopMu.Lock()
 	defer startStopMu.Unlock()
 
+	stopFlareOnlyRemoteConfig()
 	llmobs.Stop()
 	stopGlobalTracerPreservingCIVisibility()
 	globalinternal.SetTracerInitialized(false)
@@ -1308,6 +1401,7 @@ func (t *tracer) Stop() {
 	}
 	appsec.Stop()
 	remoteconfig.Stop()
+	tracerflare.Reset()
 	// Close log file last to account for any logs from the above calls
 	if t.logFile != nil {
 		t.logFile.Close()

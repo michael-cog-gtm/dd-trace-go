@@ -216,6 +216,93 @@ func TestRecordLoggerIgnore(t *testing.T) {
 	assert.Contains(t, tp.Logs()[0], "appsec")
 }
 
+func TestCapture(t *testing.T) {
+	oldLevel := GetLevel()
+	SetLevel(LevelWarn)
+	t.Cleanup(func() { SetLevel(oldLevel) })
+
+	tp := new(RecordLogger)
+	restoreLogger := UseLogger(tp)
+	t.Cleanup(restoreLogger)
+
+	capture := StartCapture(LevelDebug, 4096)
+	assert.NotNil(t, capture)
+	assert.Equal(t, LevelDebug, GetLevel())
+
+	Debug("captured debug")
+	Warn("forwarded warning")
+
+	captured := capture.Stop()
+	assert.Equal(t, LevelWarn, GetLevel())
+	assert.Equal(t, captured, capture.Stop())
+	assert.Contains(t, string(captured), prefixMsg+" DEBUG: captured debug\n")
+	assert.Contains(t, string(captured), prefixMsg+" WARN: forwarded warning\n")
+	assert.Len(t, tp.Logs(), 1)
+	assert.Contains(t, tp.Logs()[0], prefixMsg+" WARN: forwarded warning")
+	assert.NotContains(t, tp.Logs()[0], "captured debug")
+
+	line, _, _ := strings.Cut(string(captured), " ")
+	_, err := time.Parse(time.RFC3339Nano, line)
+	assert.NoError(t, err)
+}
+
+func TestCaptureOnlyOneActive(t *testing.T) {
+	capture := StartCapture(LevelDebug, 4096)
+	assert.NotNil(t, capture)
+	assert.Nil(t, StartCapture(LevelInfo, 4096))
+	capture.Stop()
+}
+
+func TestCaptureMaxBytes(t *testing.T) {
+	capture := StartCapture(LevelInfo, 96)
+	assert.NotNil(t, capture)
+
+	Info("%s", strings.Repeat("x", 128))
+	Info("dropped after truncation")
+	captured := capture.Stop()
+
+	assert.LessOrEqual(t, len(captured), 96)
+	assert.Equal(t, 1, strings.Count(string(captured), captureTruncationMarker))
+	assert.Contains(t, string(captured), captureTruncationMarker)
+	assert.NotContains(t, string(captured), "dropped after truncation")
+}
+
+func TestSetLevelDebugDuringCaptureRestoresExplicitLevel(t *testing.T) {
+	oldLevel := GetLevel()
+	SetLevel(LevelWarn)
+	capture := StartCapture(LevelDebug, 4096)
+	if capture == nil {
+		t.Fatal("expected capture to start")
+	}
+	t.Cleanup(func() {
+		capture.Stop()
+		SetLevel(oldLevel)
+	})
+
+	SetLevel(LevelDebug)
+	assert.Equal(t, LevelDebug, GetLevel())
+	capture.Stop()
+	assert.Equal(t, LevelDebug, GetLevel())
+}
+
+func TestSetLevelInfoDuringCaptureUsesCaptureThreshold(t *testing.T) {
+	oldLevel := GetLevel()
+	SetLevel(LevelWarn)
+	capture := StartCapture(LevelDebug, 4096)
+	if capture == nil {
+		t.Fatal("expected capture to start")
+	}
+	t.Cleanup(func() {
+		capture.Stop()
+		SetLevel(oldLevel)
+	})
+
+	SetLevel(LevelInfo)
+	assert.Equal(t, LevelDebug, GetLevel())
+	capture.Stop()
+	assert.Equal(t, LevelInfo, GetLevel())
+}
+
 func TestSetLoggingRate(t *testing.T) {
 	testCases := []struct {
 		input  string
