@@ -267,6 +267,42 @@ func TestCaptureMaxBytes(t *testing.T) {
 	assert.NotContains(t, string(captured), "dropped after truncation")
 }
 
+func TestSetLevelDebugDuringCaptureRestoresExplicitLevel(t *testing.T) {
+	oldLevel := GetLevel()
+	SetLevel(LevelWarn)
+	capture := StartCapture(LevelDebug, 4096)
+	if capture == nil {
+		t.Fatal("expected capture to start")
+	}
+	t.Cleanup(func() {
+		capture.Stop()
+		SetLevel(oldLevel)
+	})
+
+	SetLevel(LevelDebug)
+	assert.Equal(t, LevelDebug, GetLevel())
+	capture.Stop()
+	assert.Equal(t, LevelDebug, GetLevel())
+}
+
+func TestSetLevelInfoDuringCaptureUsesCaptureThreshold(t *testing.T) {
+	oldLevel := GetLevel()
+	SetLevel(LevelWarn)
+	capture := StartCapture(LevelDebug, 4096)
+	if capture == nil {
+		t.Fatal("expected capture to start")
+	}
+	t.Cleanup(func() {
+		capture.Stop()
+		SetLevel(oldLevel)
+	})
+
+	SetLevel(LevelInfo)
+	assert.Equal(t, LevelDebug, GetLevel())
+	capture.Stop()
+	assert.Equal(t, LevelInfo, GetLevel())
+}
+
 func TestSetLoggingRate(t *testing.T) {
 	testCases := []struct {
 		input  string

@@ -508,6 +508,7 @@ func stopFlareOnlyRemoteConfig() {
 	flareRC.mu.Lock()
 	if flareRC.started {
 		remoteconfig.Stop()
+		tracerflare.Reset()
 		flareRC.started = false
 	}
 	flareRC.mu.Unlock()
@@ -1400,6 +1401,7 @@ func (t *tracer) Stop() {
 	}
 	appsec.Stop()
 	remoteconfig.Stop()
+	tracerflare.Reset()
 	// Close log file last to account for any logs from the above calls
 	if t.logFile != nil {
 		t.logFile.Close()

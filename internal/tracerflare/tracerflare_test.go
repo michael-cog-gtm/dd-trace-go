@@ -96,6 +96,94 @@ func TestAgentConfigCaptureAndRemoval(t *testing.T) {
 	assert.Nil(t, manager.capture)
 }
 
+func TestResetStopsCaptureAndDropsPostResetDebugLogs(t *testing.T) {
+	resetManager(t)
+	onAgentConfig(configUpdate("flare", "debug"))
+	require.Equal(t, log.LevelDebug, log.GetLevel())
+
+	uploaded := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reader, err := r.MultipartReader()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var archive []byte
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			data, err := io.ReadAll(part)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if part.FormName() == "flare_file" {
+				archive = data
+			}
+		}
+		uploaded <- archive
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	setConfig(Config{
+		AgentURL:   server.URL,
+		HTTPClient: server.Client(),
+		ConfigDump: func() ([]byte, error) { return []byte(`{}`), nil },
+	})
+	manager.mu.Lock()
+	manager.rememberUUIDLocked("preserved-uuid")
+	manager.mu.Unlock()
+
+	Reset()
+	assert.Equal(t, log.LevelWarn, log.GetLevel())
+	manager.mu.Lock()
+	currentLevel := manager.currentLevel
+	levelsCount := len(manager.levels)
+	uuidPreserved := manager.hasSentUUIDLocked("preserved-uuid")
+	agentURL := manager.cfg.AgentURL
+	manager.mu.Unlock()
+	assert.Empty(t, currentLevel)
+	assert.Zero(t, levelsCount)
+	assert.True(t, uuidPreserved)
+	assert.Equal(t, server.URL, agentURL)
+
+	log.Debug("debug line after reset")
+	status := onAgentTask(taskUpdate("task", "123", "tracer_flare", "task-uuid"))
+	assert.Equal(t, state.ApplyStateAcknowledged, status["task"].State)
+
+	var archive []byte
+	select {
+	case archive = <-uploaded:
+	case <-time.After(time.Second):
+		t.Fatal("flare upload did not reach the agent")
+	}
+	reader, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	require.NoError(t, err)
+	logName := "tracer_go_" + strconv.Itoa(os.Getpid()) + ".log"
+	var capturedLog []byte
+	var logFileFound bool
+	for _, file := range reader.File {
+		if file.Name != logName {
+			continue
+		}
+		logFileFound = true
+		part, err := file.Open()
+		require.NoError(t, err)
+		capturedLog, err = io.ReadAll(part)
+		require.NoError(t, err)
+		require.NoError(t, part.Close())
+		break
+	}
+	assert.True(t, logFileFound)
+	assert.NotContains(t, string(capturedLog), "debug line after reset")
+}
+
 func TestAgentConfigConfigurationOrderDoesNotChangeState(t *testing.T) {
 	resetManager(t)
 	onAgentConfig(configUpdate("flare", "debug"))
@@ -273,19 +361,26 @@ func TestAgentTaskDuplicateUUIDUploadsOnce(t *testing.T) {
 	assert.EqualValues(t, 1, uploads.Load())
 }
 
-func TestAgentTaskUploadFailureStillAcknowledges(t *testing.T) {
+func TestAgentTaskUploadFailureCanRetry(t *testing.T) {
 	resetManager(t)
 	var uploads atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		uploads.Add(1)
-		w.WriteHeader(http.StatusInternalServerError)
+		if uploads.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 	setConfig(Config{AgentURL: server.URL, HTTPClient: server.Client()})
 
-	status := onAgentTask(taskUpdate("task", "123", "tracer_flare", "uuid-1"))
-	assert.Equal(t, state.ApplyStateAcknowledged, status["task"].State)
-	assert.EqualValues(t, 1, uploads.Load())
+	first := onAgentTask(taskUpdate("task", "123", "tracer_flare", "uuid-1"))
+	second := onAgentTask(taskUpdate("task", "123", "tracer_flare", "uuid-1"))
+	third := onAgentTask(taskUpdate("task", "123", "tracer_flare", "uuid-1"))
+	assert.Equal(t, state.ApplyStateAcknowledged, first["task"].State)
+	assert.Equal(t, state.ApplyStateAcknowledged, second["task"].State)
+	assert.Equal(t, state.ApplyStateAcknowledged, third["task"].State)
+	assert.EqualValues(t, 2, uploads.Load())
 }
 
 func TestAgentConfigStaleTimerRestoresLevel(t *testing.T) {

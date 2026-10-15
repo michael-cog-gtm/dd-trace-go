@@ -85,6 +85,15 @@ func Subscribe(cfg Config) error {
 	return nil
 }
 
+// Reset stops log capture and clears the active log-level configuration.
+func Reset() {
+	manager.mu.Lock()
+	manager.stopCaptureLocked()
+	clear(manager.levels)
+	manager.currentLevel = ""
+	manager.mu.Unlock()
+}
+
 func onAgentConfig(update remoteconfig.ProductUpdate) map[string]state.ApplyStatus {
 	type updateValue struct {
 		path  string
@@ -263,6 +272,9 @@ func onAgentTask(update remoteconfig.ProductUpdate) map[string]state.ApplyStatus
 		}
 		if err := upload(cfg, task, level, captured); err != nil {
 			log.Warn("tracer flare: failed to upload flare: %s", err.Error())
+			manager.mu.Lock()
+			manager.forgetUUIDLocked(task.UUID)
+			manager.mu.Unlock()
 		}
 		statuses[path] = state.ApplyStatus{State: state.ApplyStateAcknowledged}
 	}
@@ -295,6 +307,16 @@ func (m *flareManager) rememberUUIDLocked(uuid string) {
 	}
 	m.sentUUIDs[uuid] = struct{}{}
 	m.sentUUIDOrder = append(m.sentUUIDOrder, uuid)
+}
+
+func (m *flareManager) forgetUUIDLocked(uuid string) {
+	delete(m.sentUUIDs, uuid)
+	for i, sentUUID := range m.sentUUIDOrder {
+		if sentUUID == uuid {
+			m.sentUUIDOrder = append(m.sentUUIDOrder[:i], m.sentUUIDOrder[i+1:]...)
+			return
+		}
+	}
 }
 
 func upload(cfg Config, task agentTask, level string, captured []byte) error {

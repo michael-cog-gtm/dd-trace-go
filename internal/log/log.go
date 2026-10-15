@@ -160,6 +160,9 @@ func OpenFileAtPath(dirPath string) (*ManagedFile, error) {
 
 // SetLevel sets the given lvl as log threshold for logging.
 func SetLevel(lvl Level) {
+	if capture := captureSink.Load(); capture != nil && capture.setPreviousLevel(lvl) {
+		return
+	}
 	levelThreshold.Store(int32(lvl))
 }
 
@@ -213,18 +216,30 @@ func (c *Capture) SetLevel(lvl Level) {
 	levelThreshold.Store(int32(c.threshold))
 }
 
-// Stop ends the capture, conditionally restores the previous log threshold, and
+func (c *Capture) setPreviousLevel(lvl Level) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopped || captureSink.Load() != c {
+		return false
+	}
+	c.previousLevel = lvl
+	c.threshold = min(lvl, c.level)
+	levelThreshold.Store(int32(c.threshold))
+	return true
+}
+
+// Stop ends the capture, restores the previous log threshold, and
 // returns a copy of the captured bytes. It is safe to call multiple times.
 func (c *Capture) Stop() []byte {
 	if c == nil {
 		return nil
 	}
-	captureSink.CompareAndSwap(c, nil)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.stopped {
 		c.stopped = true
-		levelThreshold.CompareAndSwap(int32(c.threshold), int32(c.previousLevel))
+		levelThreshold.Store(int32(c.previousLevel))
+		captureSink.CompareAndSwap(c, nil)
 	}
 	return append([]byte(nil), c.data...)
 }
@@ -260,6 +275,8 @@ func (c *Capture) record(lvl Level, msg string) {
 }
 
 func (c *Capture) suppressDebugForwarding() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.previousLevel != LevelDebug
 }
 
