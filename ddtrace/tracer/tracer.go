@@ -241,7 +241,15 @@ var statsInterval = 10 * time.Second
 //
 // TODO: The entire Start/Stop code should be refactored, it's pretty gnarly.
 var startStopMu locking.Mutex
-var flareOnlyRC bool
+
+type flareRemoteConfigState struct {
+	mu      locking.Mutex
+	cancel  gocontext.CancelFunc // +checklocks:mu
+	done    chan struct{}        // +checklocks:mu
+	started bool                 // +checklocks:mu
+}
+
+var flareRC flareRemoteConfigState
 
 // reportInitTime reports the tracer initialization duration as a telemetry metric.
 func reportInitTime(start time.Time) {
@@ -437,44 +445,72 @@ func (t *tracer) startFlareRemoteConfig() {
 		return
 	}
 
-	ctx, cancel := gocontext.WithTimeout(gocontext.Background(), 2*time.Second)
-	features, err := fetchAgentFeatures(ctx, t.config.internalConfig.AgentURL(), t.config.httpClient)
-	cancel()
-	if err != nil {
-		log.Debug("tracer flare: unable to fetch agent features: %s", err.Error())
-		return
-	}
-	if !features.hasRemoteConfig {
-		log.Debug("tracer flare: agent does not support remote config")
-		return
-	}
+	ctx, cancel := gocontext.WithCancel(gocontext.Background())
+	done := make(chan struct{})
+	flareRC.mu.Lock()
+	flareRC.cancel = cancel
+	flareRC.done = done
+	flareRC.mu.Unlock()
 
-	if err := remoteconfig.Start(t.remoteConfigClientConfig()); err != nil {
-		log.Warn("Remote config startup error: %s", err.Error())
-		return
-	}
-	if err := tracerflare.Subscribe(tracerflare.Config{
-		AgentURL:   t.config.internalConfig.AgentURL().String(),
-		HTTPClient: t.config.httpClient,
-		ConfigDump: func() ([]byte, error) { return json.Marshal(t.newStartupInfo()) },
-	}); err != nil {
-		if errors.Is(err, remoteconfig.ErrClientNotStarted) {
-			log.Debug("remoteconfig: client not started, remote configuration is disabled")
-		} else {
-			log.Warn("Remote config startup error: %s", err.Error())
+	go func() {
+		defer close(done)
+		fetchCtx, fetchCancel := gocontext.WithTimeout(ctx, 2*time.Second)
+		defer fetchCancel()
+
+		features, err := fetchAgentFeatures(fetchCtx, t.config.internalConfig.AgentURL(), t.config.httpClient)
+		if err != nil {
+			log.Debug("tracer flare: unable to fetch agent features: %s", err.Error())
+			return
 		}
-		remoteconfig.Stop()
-		return
-	}
-	flareOnlyRC = true
+		if !features.hasRemoteConfig {
+			log.Debug("tracer flare: agent does not support remote config")
+			return
+		}
+
+		flareRC.mu.Lock()
+		defer flareRC.mu.Unlock()
+		if ctx.Err() != nil {
+			return
+		}
+		if err := remoteconfig.Start(t.remoteConfigClientConfig()); err != nil {
+			log.Warn("Remote config startup error: %s", err.Error())
+			return
+		}
+		if err := tracerflare.Subscribe(tracerflare.Config{
+			AgentURL:   t.config.internalConfig.AgentURL().String(),
+			HTTPClient: t.config.httpClient,
+			ConfigDump: func() ([]byte, error) { return json.Marshal(t.newStartupInfo()) },
+		}); err != nil {
+			if errors.Is(err, remoteconfig.ErrClientNotStarted) {
+				log.Debug("remoteconfig: client not started, remote configuration is disabled")
+			} else {
+				log.Warn("Remote config startup error: %s", err.Error())
+			}
+			remoteconfig.Stop()
+			return
+		}
+		flareRC.started = true
+	}()
 }
 
 func stopFlareOnlyRemoteConfig() {
-	if !flareOnlyRC {
-		return
+	flareRC.mu.Lock()
+	cancel, done := flareRC.cancel, flareRC.done
+	flareRC.cancel = nil
+	flareRC.done = nil
+	flareRC.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+		<-done
 	}
-	remoteconfig.Stop()
-	flareOnlyRC = false
+
+	flareRC.mu.Lock()
+	if flareRC.started {
+		remoteconfig.Stop()
+		flareRC.started = false
+	}
+	flareRC.mu.Unlock()
 }
 
 // storeConfig stores the process level tracing context both in an in-memory file and

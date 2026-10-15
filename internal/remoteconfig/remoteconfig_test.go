@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strconv"
 	"strings"
@@ -608,6 +609,34 @@ func TestAllCapabilitiesNoDeadlockWithSubscribe(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestUpdateStateUsesPOST(t *testing.T) {
+	type requestInfo struct {
+		method string
+		path   string
+	}
+	requests := make(chan requestInfo, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- requestInfo{method: r.Method, path: r.URL.Path}
+		_, _ = w.Write([]byte("{}"))
+	}))
+	defer server.Close()
+
+	cfg := DefaultClientConfig()
+	cfg.AgentURL = server.URL
+	cfg.HTTP = server.Client()
+	c, err := newClient(cfg)
+	require.NoError(t, err)
+	c.updateState()
+
+	select {
+	case req := <-requests:
+		require.Equal(t, http.MethodPost, req.method)
+		require.Equal(t, "/v0.7/config", req.path)
+	case <-time.After(time.Second):
+		t.Fatal("updateState did not send a request")
+	}
+}
 
 // recordingClientConfig returns an RC client config whose HTTP client records
 // each request (non-blocking) and returns an empty body. PollInterval is 1h, so
